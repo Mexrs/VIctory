@@ -2619,6 +2619,28 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
     }
 
+    /// Issue #293, compute hash f6e47efa50226beb: a 64-bit pointer held in
+    /// root-constant dwords 2-3 and used directly as a scalar-load address
+    /// addresses title memory, like the dwords 0-1 pointer in
+    /// `root_constant_zero_offsets_tables_and_root_descriptors`. Upstream
+    /// traced this hash to this shape; on this head the pair is proven by
+    /// the root parameter, so it lowers through the title-memory path
+    /// instead of refusing. An SGPR no root parameter fills stays refused
+    /// (see `untraceable_addresses_fail_with_a_reason`).
+    #[test]
+    fn root_constant_pointer_in_dwords_2_and_3_addresses_title_memory() {
+        let r = track_words(
+            &[
+                0xF400_0181,
+                0xFA00_0008, // s_load_dword s6, s[2:3], 0x8 (root constants dwords 2-3)
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 4)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0))]);
+    }
+
     #[test]
     fn root_constant_zero_offsets_tables_and_root_descriptors() {
         // RootType::Constants dword 0 (s0) as an SMEM soffset and via s_add_u32
