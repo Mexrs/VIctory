@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod geometry;
 
 type Why = &'static str;
 
@@ -550,6 +551,9 @@ impl<'a> Lower<'a> {
             }
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
+        if let StageIo::Gs(gs) = &x.native.io {
+            s.gs = Some(gs.max_vertices);
+        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -1468,6 +1472,7 @@ impl<'a> Lower<'a> {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
+                    None if self.s.gs.is_some() => Val::Missing("a geometry VGPR input"),
                     None => Val::I32(self.s.m.i32(0)),
                 },
             };
@@ -1588,46 +1593,7 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
-        let e = &mut self.s.inputs[id];
-        e.usage |= 1 << col;
-        let (int, bit) = (e.comp != 9, e.comp == 1);
-        let ty = if bit {
-            self.s.t.i1
-        } else if int {
-            self.s.t.i32
-        } else {
-            self.s.t.f32
-        };
-        let suffix = if bit {
-            ".i1"
-        } else if int {
-            ".i32"
-        } else {
-            ".f32"
-        };
-        let entry = self.s.entry;
-        let args = [
-            self.s.m.i32(id as u32),
-            self.s.m.i32(0),
-            self.s.m.i8(col),
-            self.s.m.undef(self.s.t.i32),
-        ];
-        let v = self.s.op(
-            entry,
-            &format!("loadInput{suffix}"),
-            Attr::ReadNone,
-            ty,
-            4,
-            &args,
-        );
-        if bit {
-            let z = self.s.m.cast(entry, Cast::ZExt, v, self.s.t.i32);
-            Val::I32(z)
-        } else if int {
-            Val::I32(v)
-        } else {
-            Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
-        }
+        self.load_vertex_input(id, col, None)
     }
 
     /// The DXIL form of an IR value.
@@ -3502,6 +3468,9 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        if self.geometry_inst(inst, offset)? {
+            return Ok(());
+        }
         let name = inst.name();
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
