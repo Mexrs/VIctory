@@ -11815,6 +11815,35 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_mask_join_of_an_untracked_mask_is_refused() {
+        // The saved EXEC, a mask holding lanes outside the region's edge,
+        // joined with data in a reused register and read per lane after the
+        // join: the lanes that skipped the region are in the mask, so 0 is
+        // not theirs and the join is refused. Contrast
+        // `synthetic_tests::a_compare_mask_joined_with_data_on_the_skip_
+        // edge_is_0_there`, where the mask is made inside the region by a
+        // compare, so the skipping lanes read 0 and it lowers.
+        let words = [
+            0xBE86_0385, // s_mov_b32 s6, 5
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0001, // s_cbranch_execz +1
+            0xBE86_0308, // s_mov_b32 s6, s8
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xD501_0003,
+            0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+            S_ENDPGM,
+        ];
+        let Err(crate::ShaderError::Unsupported { what, .. }) = lowers(&words, 1 << 7) else {
+            panic!("a lane-mask join of an untracked mask translated");
+        };
+        assert!(
+            what.contains("a lane-mask join of an untracked mask"),
+            "{what}"
+        );
+    }
+
+    #[test]
     fn a_scalar_result_needs_no_exec() {
         // s6 is 0 where every lane skips and the saved EXEC where some run:
         // no lane mask at the per-lane join. EXEC taken from it guards only
