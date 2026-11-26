@@ -7,7 +7,7 @@ use crate::emit::bitcode::{Attr, Cast};
 use crate::ir::Inst;
 
 impl<'a> Lower<'a> {
-    fn load_vertex_input(&mut self, id: usize, col: u8, vertex: Option<u8>) -> Val {
+    pub(crate) fn load_vertex_input(&mut self, id: usize, col: u8, vertex: Option<u8>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -58,7 +58,7 @@ impl<'a> Lower<'a> {
     /// and stream messages are handled here; anything else falls
     /// through to the ordinary instruction path. Returns whether it
     /// handled the instruction.
-    fn geometry_inst(&mut self, inst: &'a Inst, offset: usize) -> Result<bool, Stop> {
+    pub(crate) fn geometry_inst(&mut self, inst: &'a Inst, offset: usize) -> Result<bool, Stop> {
         let Some(gs) = self.x.io.geometry.as_deref() else {
             return Ok(false);
         };
