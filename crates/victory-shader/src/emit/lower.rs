@@ -4257,6 +4257,7 @@ impl<'a> Lower<'a> {
                 .find_map(|d| {
                     d.source.leaves().into_iter().find_map(|l| match *l {
                         Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                        Source::Fetched { load, first } if load == site => Some((d.site, first)),
                         _ => None,
                     })
                 })
@@ -4272,12 +4273,18 @@ impl<'a> Lower<'a> {
                 _ => None,
             }
         };
+        // Two accesses to one table entry: the same offset, and the dynamic
+        // terms equal, or one is the first lane's read of the other (a
+        // scalar load at the first lane's offset reads the entry a per-lane
+        // load fetches).
         let same = |a: &Address, b: &Address| {
             a.param == b.param
                 && a.offset == b.offset
                 && (a.dynamic == b.dynamic
                     || a.dynamic.and_then(lane_source).is_some()
-                        && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source))
+                        && a.dynamic.and_then(lane_source) == b.dynamic.and_then(lane_source)
+                    || b.dynamic.and_then(lane_source).is_some()
+                        && b.dynamic.and_then(lane_source) == a.dynamic)
         };
         let address = self.scalar.get(&site);
         let use_at = use_of(site).or_else(|| {
@@ -11337,6 +11344,66 @@ mod tests {
             slot: 0,
         }];
         lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
+    fn a_descriptor_fetched_per_lane_is_sized_from_the_first_lanes_table_entry() {
+        // As the depth-skinning mesh shaders of #293: each lane fetches its
+        // own 4-dword structured buffer descriptor from the table in title
+        // memory, and the program reads the record count of the first
+        // lane's entry with a scalar load from the table at the first
+        // lane's byte offset, then reads the buffer at index count - 1
+        // with the first lane's descriptor in a waterfall loop. The size
+        // read's descriptor is found through the per-lane fetch, not a
+        // table load of its own.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3402_0085, // v_lshlrev_b32 v1, 5, v0
+            0xDC38_8000,
+            0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5]
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0x7E38_0501, // v_readfirstlane_b32 s28, v1
+            0xF408_0602,
+            0x3800_0000, // s_load_dwordx4 s[24:27], s[4:5], s28
+            0x811D_C11A, // s_add_i32 s29, s26, -1
+            0xBE94_037E, // s_mov_b32 s20, exec_lo
+            0x7E18_0504, // L1: v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xD4E2_0015,
+            0x0002_080C, // v_cmp_eq_u64_e64 s21, s[12:13], v[4:5]
+            0xD4E2_0016,
+            0x0002_0C0E, // v_cmp_eq_u64_e64 s22, s[14:15], v[6:7]
+            0x8715_1615, // s_and_b32 s21, s21, s22
+            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+            0xBF80_0000, // s_nop 0
+            0xF420_0786,
+            0x3A00_0000, // s_buffer_load_dword s30, s[12:15], s29
+            0x7E04_021E, // v_mov_b32 v2, s30
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFEF, // s_cbranch_execnz L1
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 80,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_wave(&words, layout, used, false).unwrap();
+        // The size read is a genuine first-lane operation.
+        assert!(l.wave_ops);
     }
 
     #[test]
