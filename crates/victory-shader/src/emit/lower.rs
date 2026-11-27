@@ -11348,14 +11348,9 @@ mod tests {
 
     #[test]
     fn a_descriptor_fetched_per_lane_is_sized_from_the_first_lanes_table_entry() {
-        // As the depth-skinning mesh shaders of #293: each lane fetches its
-        // own 4-dword structured buffer descriptor from the table in title
-        // memory, and the program reads the record count of the first
-        // lane's entry with a scalar load from the table at the first
-        // lane's byte offset, then reads the buffer at index count - 1
-        // with the first lane's descriptor in a waterfall loop. The size
-        // read's descriptor is found through the per-lane fetch, not a
-        // table load of its own.
+        // Depth-skinning shape (#293): each lane fetches its own 4-dword
+        // descriptor; a scalar load reads the first lane's record count,
+        // then a waterfall loop reads the buffer at index count - 1.
         let words = [
             0xBE84_0300, // s_mov_b32 s4, s0
             0xBE85_0380, // s_mov_b32 s5, 0
