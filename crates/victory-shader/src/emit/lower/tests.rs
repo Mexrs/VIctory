@@ -534,6 +534,41 @@
     }
 
     #[test]
+    fn a_scalar_buffer_use_reads_an_odd_stride_descriptor_as_raw() {
+        // Scalar-read-as-data shape (#293, #136): the table descriptor's
+        // declared stride is 6, so the scalar load of its dword 2 would
+        // refuse on the odd stride; its only use is an `s_buffer_load_dword`,
+        // so the descriptor is read as a raw view instead.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x810C_C10A, // s_add_i32 s12, s10, -1
+            0xF408_0402,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[4:5], null
+            0xF420_0788,
+            0x1800_0000, // s_buffer_load_dword s30, s[16:19], s12
+            0x7E04_021E, // v_mov_b32 v2, s30
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 6,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
     fn a_waterfall_loop_that_only_sizes_takes_the_kind_of_the_sampled_one() {
         // Each lane names table entry (lane & 1) by its byte offset in v7.
         // A first waterfall loop only reads the width bits of the entry

@@ -4371,6 +4371,22 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            // #136: a descriptor the code reads with scalar buffer loads
+            // (`s_buffer_`): structured by the used-resource entry's stride
+            // when it is valid, else raw — a scalar load of its dwords takes
+            // the view's own size instead of refusing on an odd stride.
+            Fields::Smem { .. } if un.starts_with("s_buffer_") => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
+                (props, None)
+            }
             // A buffer the code reads with scalar loads (`buf[buf.Length - 1]`
             // at a uniform index): structured by the used-resource entry's
             // stride, so its record count is in elements, else raw (bytes).
