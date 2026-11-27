@@ -1942,6 +1942,21 @@ impl<'a> Tracer<'a> {
             lanes.mask_bits(low?, high)
         };
         let exec = |inst: &Inst| mask(inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)));
+        // The EXEC mask an instruction in this block runs under: the mask
+        // it reads, or, for an instruction that reads no EXEC of its own
+        // (a scalar load), the mask written by the closest earlier
+        // instruction in the block that writes EXEC.
+        let exec_at = |at: usize| {
+            let live = |reg: Reg| {
+                block.insts[at].read(reg).or_else(|| {
+                    block.insts[..at]
+                        .iter()
+                        .rev()
+                        .find_map(|inst| inst.write(reg))
+                })
+            };
+            mask(live(Reg::S(EXEC)), live(Reg::S(EXEC + 1)))
+        };
         // The reads belong to this loop's own block: a loop around this one
         // (one per operand, as LLVM nests them for a per-lane image and
         // sampler) is not followed.
@@ -1951,10 +1966,10 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
+        let selected = exec_at(access).ok_or(SELECT)?;
         if accesses
             .iter()
-            .any(|&i| exec(&block.insts[i]) != Some(selected))
+            .any(|&i| exec_at(i) != Some(selected))
         {
             return Err(SELECT);
         }
