@@ -191,6 +191,21 @@ pub struct Export {
     pub done: bool,
 }
 
+/// One output channel an export program writes to ES->GS LDS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LdsOutput {
+    pub vertex: u32,
+    pub row: u8,
+    pub channel: u8,
+    pub value: Value,
+}
+
+/// An output ring address: a byte offset into the vertex's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LdsAddr {
+    Output(u32),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Io {
     pub geometry: Option<Box<crate::geometry::Streams>>,
@@ -205,6 +220,8 @@ pub struct Io {
     /// root parameter's, then the primitive mask and the ordered-section
     /// (POPS) collision id, as every pixel program of the title reads them).
     pub initialized_sgprs: Option<u8>,
+    /// Export program vertex outputs written to ES->GS LDS (`ds_write*`).
+    pub lds_outputs: Vec<(Site, Vec<LdsOutput>)>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -283,6 +300,30 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 (Reg::S(3), Input::MergedWaveInfo),
             ];
             (loaded, &[][..], &ms.outputs[..])
+        }
+        (
+            StageIo::Es {
+                inputs, outputs, ..
+            },
+            HwStage::Es,
+        ) => {
+            // Merged ES+GS ABI: v0..v4 carry GS inputs; ES system VGPRs start
+            // at v5 (vertex id), v7 (primitive id), v8 (instance id).
+            let mut loaded = vec![
+                (Reg::V(5), Input::VertexId),
+                (Reg::V(7), Input::PrimitiveId),
+                (Reg::V(8), Input::InstanceId),
+            ];
+            for i in inputs {
+                for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                    let input = Input::Attribute {
+                        row: i.row,
+                        channel,
+                    };
+                    loaded.push((Reg::V(i.vgpr + channel), input));
+                }
+            }
+            (loaded, &[][..], &outputs[..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
@@ -450,7 +491,186 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    if let (StageIo::Es { vertex_dwords, .. }, HwStage::Es) = (&native.io, native.stage) {
+        raise_es_lds(p, *vertex_dwords, *vertex_dwords, &mut io)?;
+    }
     Ok(io)
+}
+
+/// The elements a `ds_read`/`ds_write` moves: (byte offset, dwords).
+fn ds_elements(name: &str, offset0: u8, offset1: u8) -> Option<Vec<(u32, u32)>> {
+    let w = match name.rsplit('_').next() {
+        Some("b64") => 2,
+        Some("b96") => 3,
+        Some("b128") => 4,
+        Some("b32") => 1,
+        _ => return None,
+    };
+    let rest = name
+        .strip_prefix("ds_read")
+        .or_else(|| name.strip_prefix("ds_write"))?;
+    if rest.starts_with('2') {
+        let scale = 4 * w * if name.contains("st64") { 64 } else { 1 };
+        Some(vec![
+            (u32::from(offset0) * scale, w),
+            (u32::from(offset1) * scale, w),
+        ])
+    } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+        let off = u32::from(offset0) | u32::from(offset1) << 8;
+        Some(vec![(off, w)])
+    } else {
+        None
+    }
+}
+
+/// Traces an export program's output writes (`ds_write*`) to the ES->GS
+/// ring, raising them to outputs by row and channel.
+fn raise_es_lds(
+    p: &Program,
+    stride_dwords: u32,
+    vertex_dwords: u32,
+    io: &mut Io,
+) -> Result<(), ShaderError> {
+    let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    let stride_bytes = stride_dwords.saturating_mul(4);
+    let mut consts: std::collections::HashMap<Value, u32> = std::collections::HashMap::new();
+    let mut addrs: std::collections::HashMap<Value, LdsAddr> = std::collections::HashMap::new();
+    let val_of = |inst: &Inst, op: &Operand| -> Option<Value> {
+        match *op {
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            Operand::Scalar { code, .. } if code != crate::gfx10::NULL => inst.read(Reg::S(code)),
+            _ => None,
+        }
+    };
+    let const_of = |consts: &std::collections::HashMap<Value, u32>,
+                    inst: &Inst,
+                    op: &Operand|
+     -> Option<u32> {
+        match *op {
+            Operand::Const(k) => crate::resource::inline(k),
+            Operand::Literal(x) => Some(x),
+            Operand::Scalar { code, .. } if code == crate::gfx10::NULL => Some(0),
+            _ => val_of(inst, op).and_then(|v| consts.get(&v).copied()),
+        }
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    for &b in &order {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let site = (b, i);
+            let at = inst.machine.offset;
+            let name = inst.name();
+            match &inst.fields {
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code, .. }),
+                    src,
+                    ..
+                } if name == "s_mov_b32" => {
+                    if let Some(w) = inst.write(Reg::S(*code))
+                        && let Some(c) = src.first().and_then(|o| const_of(&consts, inst, o))
+                    {
+                        consts.insert(w, c);
+                    }
+                }
+                Fields::Valu(v) => {
+                    let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
+                        continue;
+                    };
+                    let Some(w) = inst.write(Reg::V(dreg)) else {
+                        continue;
+                    };
+                    if name == "v_mov_b32" && v.sdwa.is_none() {
+                        if let Some(c) = v.src.first().and_then(|o| const_of(&consts, inst, o)) {
+                            consts.insert(w, c);
+                        } else if let Some(a) = v
+                            .src
+                            .first()
+                            .and_then(|o| val_of(inst, o))
+                            .and_then(|x| addrs.get(&x).copied())
+                        {
+                            addrs.insert(w, a);
+                        }
+                        continue;
+                    }
+                    // Output ring base: `v_mad_u32_u24 dst, stride_bytes, lane, base`
+                    // (or `lane, stride_bytes, base`).
+                    if name == "v_mad_u32_u24" && stride_bytes > 0 && v.src.len() >= 2 {
+                        let c0 = const_of(&consts, inst, &v.src[0]);
+                        let c1 = const_of(&consts, inst, &v.src[1]);
+                        if c0 == Some(stride_bytes) || c1 == Some(stride_bytes) {
+                            addrs.insert(w, LdsAddr::Output(0));
+                            continue;
+                        }
+                    }
+                    if matches!(name, "v_add_nc_u32" | "v_add_co_u32") && v.src.len() >= 2 {
+                        for (a_i, c_i) in [(0, 1), (1, 0)] {
+                            if let Some(LdsAddr::Output(off)) =
+                                val_of(inst, &v.src[a_i]).and_then(|x| addrs.get(&x).copied())
+                                && let Some(c) = const_of(&consts, inst, &v.src[c_i])
+                            {
+                                addrs.insert(w, LdsAddr::Output(off.wrapping_add(c)));
+                            }
+                        }
+                    }
+                }
+                Fields::Ds {
+                    addr,
+                    data,
+                    offset0,
+                    offset1,
+                    gds,
+                    ..
+                } => {
+                    if *gds {
+                        return Err(unsupported(at, "GDS in a merged geometry stage"));
+                    }
+                    let Some(a_val) = addr.as_ref().and_then(|o| val_of(inst, o)) else {
+                        continue;
+                    };
+                    if name.starts_with("ds_write") {
+                        let Some(LdsAddr::Output(base_off)) = addrs.get(&a_val).copied() else {
+                            return Err(unsupported(
+                                at,
+                                "an LDS write of a merged geometry stage not to its outputs",
+                            ));
+                        };
+                        if vertex_dwords == 0 {
+                            return Err(unsupported(
+                                at,
+                                "a merged geometry stage without a vertex size",
+                            ));
+                        }
+                        let elems = ds_elements(name, *offset0, *offset1)
+                            .ok_or_else(|| unsupported(at, "an output write of bytes or halves"))?;
+                        let mut writes = Vec::new();
+                        for (e_i, (off, w)) in elems.into_iter().enumerate() {
+                            let Some(&Operand::Vector { reg, .. }) = data.get(e_i) else {
+                                return Err(unsupported(at, "an output write without its data"));
+                            };
+                            for k in 0..w {
+                                let value = inst.read(Reg::V(reg + k as u8)).ok_or_else(|| {
+                                    unsupported(at, "an output write without its data")
+                                })?;
+                                let byte = base_off.wrapping_add(off).wrapping_add(4 * k);
+                                if byte % 4 != 0 {
+                                    return Err(unsupported(at, "an unaligned output write"));
+                                }
+                                let dword = byte / 4;
+                                writes.push(LdsOutput {
+                                    vertex: 0,
+                                    row: (dword / 4) as u8,
+                                    channel: (dword % 4) as u8,
+                                    value,
+                                });
+                            }
+                        }
+                        io.lds_outputs.push((site, writes));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.

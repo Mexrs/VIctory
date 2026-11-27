@@ -121,6 +121,7 @@ const VS_INPUTS: usize = 0x24;
 const VS_INPUT_COUNT: usize = 0xc4;
 const VS_OUTPUTS: usize = 0xc8;
 const VS_OUTPUT_COUNT: usize = 0x188;
+const ES_VERTEX_DWORDS: usize = 0x1ac;
 const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
@@ -285,6 +286,13 @@ pub enum StageIo {
     Vs {
         inputs: Vec<VsInput>,
         outputs: Vec<VsOutput>,
+    },
+    /// Export stage (vertex shader compiled to feed a geometry shader via ES->GS LDS).
+    Es {
+        inputs: Vec<VsInput>,
+        outputs: Vec<VsOutput>,
+        /// Dwords written per vertex into ES->GS LDS.
+        vertex_dwords: u32,
     },
     Ps {
         inputs: Vec<PsInput>,
@@ -710,6 +718,7 @@ fn read_program(payload: &[u8], start: u64, stage: HwStage) -> Result<NativeProg
     let io = match stage {
         HwStage::Ps => ps_io(stage_data, code.len())?,
         HwStage::Vs => vs_io(stage_data)?,
+        HwStage::Es => es_io(stage_data)?,
         HwStage::Cs => StageIo::Cs(ComputeIo {
             rsrc2: u32_at(stage_data, CS_RSRC2)?,
             threads: [
@@ -836,6 +845,18 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         .collect();
     let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+fn es_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    let StageIo::Vs { inputs, outputs } = vs_io(data)? else {
+        unreachable!()
+    };
+    let vertex_dwords = u32_at(data, ES_VERTEX_DWORDS)?;
+    Ok(StageIo::Es {
+        inputs,
+        outputs,
+        vertex_dwords,
+    })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {

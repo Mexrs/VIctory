@@ -393,9 +393,13 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let geometry = crate::dxbc::u32_at(dxil.data, 0).is_ok_and(|v| v >> 16 == 2);
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
+    // A vertex shader compiled for a geometry shader's pipelines is an
+    // export program; a container with only one translates it as a plain
+    // vertex shader.
+    let mut programs = crate::native_programs(dxil.data)?;
+    let native = programs
+        .iter()
+        .position(|p| {
             if geometry {
                 p.stage == HwStage::Gs
             } else {
@@ -405,6 +409,8 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
                 )
             }
         })
+        .or_else(|| programs.iter().position(|p| p.stage == HwStage::Es))
+        .map(|i| programs.swap_remove(i))
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, geometry, pixel, compute or mesh program",
