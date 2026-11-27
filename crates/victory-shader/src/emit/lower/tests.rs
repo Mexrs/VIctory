@@ -504,6 +504,36 @@
     }
 
     #[test]
+    fn a_table_descriptor_with_unknown_stride_reads_its_runtime_stride() {
+        // Structured-stride shape (#293): the table descriptor's declared
+        // stride is 0, so an element-indexed load takes the view's own
+        // stride from the host's view-stride table instead of refusing.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        lower_with(&words, layout, used).unwrap();
+    }
+
+    #[test]
     fn a_waterfall_loop_that_only_sizes_takes_the_kind_of_the_sampled_one() {
         // Each lane names table entry (lane & 1) by its byte offset in v7.
         // A first waterfall loop only reads the width bits of the entry

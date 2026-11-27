@@ -5299,6 +5299,40 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, word, bits))
     }
 
+    /// The byte stride of the buffer view a descriptor loaded from a heap
+    /// names (a table or the resource heap): dword `index` of the host's
+    /// view-stride table, read like [`Self::view_stride`] but without its
+    /// resource-heap-only gate. A table descriptor's declared stride is
+    /// not always valid (0, or not a multiple of 4), and the host's table
+    /// holds the view's own stride for every title slot, so the table
+    /// load's heap index reads the right stride. A descriptor chosen by
+    /// control flow, built around a root view, or not loaded from a heap
+    /// stays refused, as does one [`Self::view_stride`] cannot resolve.
+    fn runtime_stride(&mut self, src: &Source) -> Result<V, Why> {
+        const WHY: Why = "a structured buffer of unknown stride";
+        let heap = |load: &Site| {
+            self.scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap))
+        };
+        let leaves = src.leaves();
+        if leaves.is_empty()
+            || !leaves.iter().all(|l| match l {
+                Source::Loaded { load, .. } | Source::Fetched { load, .. } => heap(load),
+                _ => false,
+            })
+        {
+            return Err(WHY);
+        }
+        let index = match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, false)?,
+            Source::Phi { .. } => return Err(WHY),
+            _ => self.lane_heap_index(src, false)?,
+        };
+        Ok(self.stride_at(index))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -9556,13 +9590,23 @@ impl<'a> Lower<'a> {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                        // The declared stride is unknown, but the descriptor
+                        // is loaded from a heap: the view's own stride comes
+                        // from the host's view-stride table, and the atomic
+                        // runs as a raw one at the folded byte offset.
+                        let stride = self.runtime_stride(src)?;
+                        let row = self.s.m.bin(self.cur, Bin::Mul, index, stride);
+                        let at = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        let (h, off) =
+                            self.raw_view(site, src, at, 4, (11 | u, 0), true, guard)?;
+                        (h, [off, iu, iu], off)
+                    } else {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        let s = self.s.m.i32(stride);
+                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                        let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
+                        (h, [index, off, iu], byte)
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    let s = self.s.m.i32(stride);
-                    let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                    let byte = self.s.m.bin(self.cur, Bin::Add, row, off);
-                    (h, [index, off, iu], byte)
                 }
                 None => {
                     let (h, off) = self.raw_view(site, src, off, 4, (11 | u, 0), true, guard)?;
@@ -9709,13 +9753,28 @@ impl<'a> Lower<'a> {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                            // The declared stride is unknown, but the
+                            // descriptor is loaded from a heap: the view's
+                            // own stride comes from the host's view-stride
+                            // table, and the store runs as a raw one at the
+                            // folded byte offset.
+                            let stride = self.runtime_stride(src)?;
+                            let row = self.s.m.bin(self.cur, Bin::Mul, index, stride);
+                            let at = self.s.m.bin(self.cur, Bin::Add, row, off);
+                            let n = 4 * count;
+                            let (h, off) = self.raw_view(
+                                site, src, at, n, (11 | u, 0), true, guard,
+                            )?;
+                            args.extend([h, off, iu]);
+                            (byte, bytes) = (off, n);
+                        } else {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
+                            let s = self.s.m.i32(stride);
+                            let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
+                            (byte, bytes) =
+                                (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
-                        let s = self.s.m.i32(stride);
-                        let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
                     }
                     None => {
                         let n = 4 * count;
@@ -9819,17 +9878,36 @@ impl<'a> Lower<'a> {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                        // The declared stride is unknown, but the descriptor
+                        // is loaded from a heap: the view's own stride comes
+                        // from the host's view-stride table, and the load
+                        // runs as a raw one at the folded byte offset.
+                        let stride = self.runtime_stride(src)?;
+                        let row = self.s.m.bin(c, Bin::Mul, index, stride);
+                        let at = self.s.m.bin(c, Bin::Add, row, off);
+                        let bytes = 4 * count;
+                        let (h, off) = self.raw_view(
+                            site, src, at, bytes, (11 | u, 0), false, guard,
+                        )?;
+                        self.s.op(
+                            self.cur,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, off, iu, mask, align],
+                        )
+                    } else {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
                 }
                 None => {
                     let bytes = 4 * count;
