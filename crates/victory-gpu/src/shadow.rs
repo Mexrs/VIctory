@@ -1053,33 +1053,100 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+///
+/// The copies used to be kept forever: there is no free hook to key them
+/// to, since the title frees through its own allocator (its
+/// `__XMemAllocationHooks__`, which `XMemFree` calls without a size) and
+/// no notification of a heap free reaches here — the remap notices only
+/// cover physical-page map/unmap. So the map is capped instead: the
+/// least-recently-used copy the map alone holds goes when it is over the
+/// cap. Lists still hold the copies their submissions use, so those stay
+/// alive until the list is done with them, and a window dropped and
+/// touched again is simply copied again from title memory.
 const WINDOW: u64 = 4 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Loose windows are kept under a gigabyte: far above any live working
+/// set (the title's interface vertices and the like), far below the
+/// commit limit they used to grow towards without bound (upstream #471).
+const LOOSE_CAP: u64 = 1 << 30;
+
+/// Copies of title memory outside buffers, by (start, length): each copy
+/// and when it was last used, the bytes they hold in all, and the cap
+/// they are kept under.
+struct Loose {
+    map: BTreeMap<(u64, u64), (Arc<Shadow>, u64)>,
+    bytes: u64,
+    tick: u64,
+    cap: u64,
+}
+
+static LOOSE: Mutex<Loose> = Mutex::new(Loose {
+    map: BTreeMap::new(),
+    bytes: 0,
+    tick: 0,
+    cap: LOOSE_CAP,
+});
+
+impl Loose {
+    /// The copy of the aligned window(s) `[address, end)` touches, made
+    /// if there is none.
+    fn get(&mut self, address: u64, end: u64) -> Option<Arc<Shadow>> {
+        let start = address & !(WINDOW - 1);
+        let len = end.next_multiple_of(WINDOW) - start;
+        self.tick += 1;
+        if let Some((shadow, used)) = self.map.get_mut(&(start, len)) {
+            *used = self.tick;
+            return Some(shadow.clone());
+        }
+        let (buffer, data) = host()?.shared_buffer(len)?;
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory copied to the host"
+        );
+        let shadow = Shadow::new(buffer, data, gpu, start, len);
+        self.map.insert((start, len), (shadow.clone(), self.tick));
+        self.bytes += len;
+        changed();
+        self.evict();
+        Some(shadow)
+    }
+
+    /// Drop the least-recently-used copies the map alone holds until the
+    /// bytes fit under the cap. A copy a list holds (its count above one)
+    /// is never dropped: the list keeps it alive until its submission is
+    /// done, and the map's hold going only frees the buffer once the
+    /// list is done with it too. When nothing can go, the map stays over
+    /// the cap until a list drops its copy: refusing the copy would
+    /// refuse the draw.
+    fn evict(&mut self) {
+        let mut freed = 0;
+        while self.bytes > self.cap {
+            let Some(victim) = self
+                .map
+                .iter()
+                .filter(|(_, (shadow, _))| Arc::strong_count(shadow) == 1)
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.bytes -= victim.1;
+            freed += victim.1;
+            self.map.remove(&victim);
+        }
+        if freed > 0 {
+            tracing::debug!(freed, "loose memory evicted under the cap");
+            changed();
+        }
+    }
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
-    }
-    let (buffer, data) = host()?.shared_buffer(len)?;
-    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    tracing::debug!(
-        start = format_args!("{start:#x}"),
-        len,
-        "loose memory copied to the host"
-    );
-    let shadow = Shadow::new(buffer, data, gpu, start, len);
-    map.insert((start, len), shadow.clone());
-    changed();
-    Some(shadow)
+    LOOSE.lock().unwrap_or_else(|e| e.into_inner()).get(address, end)
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -1266,7 +1333,14 @@ impl Arena {
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map
+            .values()
+            .map(|(s, _)| s.clone()),
+    );
     all
 }
 
@@ -1281,8 +1355,9 @@ pub(crate) fn near(va: u64) -> String {
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .map
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|(s, _)| (s.gpu, s.start, s.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();
@@ -1656,5 +1731,68 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// Loose windows are capped: the least-recently-used copy the map
+    /// alone holds goes when the map is over the cap, while one a list
+    /// holds (here, this test) stays — and when every copy is held,
+    /// nothing goes, the map just runs over the cap until a list drops
+    /// its copy. A local map, so the test never touches the global one
+    /// other tests use.
+    #[test]
+    fn loose_windows_are_capped_and_held_ones_survive() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        // Five windows of plain title memory (not the runtime's, so no
+        // buffer covers them and the loose path takes them): a reservation
+        // rounded up to a window boundary, so each address lands in its
+        // own window.
+        // SAFETY: a fresh reservation, freed below.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                6 * WINDOW as usize,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as usize
+        };
+        assert_ne!(base, 0, "a reservation");
+        let start = (base as u64).next_multiple_of(WINDOW);
+        let at = |n: u64| start + n * WINDOW;
+        let mut loose = Loose {
+            map: BTreeMap::new(),
+            bytes: 0,
+            tick: 0,
+            cap: 3 * WINDOW,
+        };
+        let a = loose.get(at(0), at(0) + 1).expect("a window");
+        let b = loose.get(at(1), at(1) + 1).expect("a window");
+        let c = loose.get(at(2), at(2) + 1).expect("a window");
+        assert_eq!((loose.bytes, loose.map.len()), (3 * WINDOW, 3));
+        // A re-hit is the same copy, and refreshes its use.
+        assert!(Arc::ptr_eq(&a, &loose.get(at(0), at(0) + 1).expect("a window")));
+        // b is the least recently used copy the map alone holds: dropping
+        // this test's hold on it lets the next window evict it.
+        drop(b);
+        let d = loose.get(at(3), at(3) + 1).expect("a window");
+        assert_eq!(loose.bytes, 3 * WINDOW, "one window went for the new one");
+        assert!(!loose.map.contains_key(&(at(1), WINDOW)), "the unheld, oldest window went");
+        for n in [0, 2, 3] {
+            assert!(loose.map.contains_key(&(at(n), WINDOW)), "window {n} stays");
+        }
+        // Held copies never go: with every copy held, a fifth window stays
+        // over the cap rather than evicting one a list is using.
+        let e = loose.get(at(4), at(4) + 1).expect("a window");
+        assert_eq!((loose.bytes, loose.map.len()), (4 * WINDOW, 4), "over the cap, nothing evicted");
+        assert!(loose.map.contains_key(&(at(4), WINDOW)));
+        assert!(Arc::ptr_eq(&d, &loose.map[&(at(3), WINDOW)].0), "the held window stays");
+        drop((a, c, d, e));
+        drop(loose);
+        // SAFETY: the reservation above, freed once.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }
